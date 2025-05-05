@@ -1,0 +1,494 @@
+import websocket
+import json
+import time
+import threading
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from threading import Lock
+import sys
+
+# Replace with your API token and APP ID
+API_TOKEN = "your_api_token"
+APP_ID = "your_app_id"
+
+# WebSocket URL
+DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
+
+# Deriv-supported markets
+SUPPORTED_MARKETS = ["R_10", "R_25", "R_50"]
+
+# Initialize variables
+websocket_connection = None
+market_data = {}
+candles = {}    # candles[market] will hold candle data lists
+selected_market = None  # Not used for trading now; scanning will loop through all supported markets
+ml_model = None
+scaler_global = None
+lock = Lock()   # Thread-safe lock for shared variables
+
+# Cooldown and recovery parameters
+COOLDOWN_PERIOD = timedelta(seconds=30)
+RECOVERY_PAUSE = timedelta(minutes=3)
+last_loss_time = None
+consecutive_losses = 0
+
+# Trade frequency control
+TRADE_LIMIT_PER_MINUTE = 3
+trade_timestamps = []
+
+# Profit lock parameters
+PROFIT_LOCK_THRESHOLD = 2.0
+is_profit_locked = False
+
+# Risk and compounding parameters
+initial_balance = 200
+stake = initial_balance * 0.01  # initial risk stake (1%)
+max_stake = 10
+stake_growth = 0.15
+daily_loss_limit = initial_balance * 0.05
+daily_profit_target = initial_balance * 0.2
+current_balance = initial_balance
+current_profit = 0
+HISTORICAL_CANDLES = 50  # Number of candles to keep for analysis
+MODEL_TRAIN_INTERVAL = timedelta(minutes=5)
+last_model_train_time = None
+
+# Trend filter parameters
+RSI_PERIOD = 14
+RSI_THRESHOLD = 70
+
+# Debug mode for detailed logs
+DEBUG_MODE = True
+
+# Trade log
+trade_log = []
+
+# Global flag for market scanner thread
+scanner_thread_started = False
+
+# ---------------- Helper Indicator Functions ----------------
+def calculate_rsi(prices, period=RSI_PERIOD):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    RS = gain / loss
+    RSI = 100 - (100 / (1 + RS))
+    return RSI
+
+def calculate_macd(prices, short=12, long=26, signal=9):
+    ema_short = prices.ewm(span=short, adjust=False).mean()
+    ema_long = prices.ewm(span=long, adjust=False).mean()
+    macd_line = ema_short - ema_long
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd_line - signal_line
+    return macd_line, signal_line, macd_hist
+
+def calculate_bollinger(prices, window=20, num_std=2):
+    sma = prices.rolling(window=window).mean()
+    std = prices.rolling(window=window).std()
+    upper_band = sma + std * num_std
+    lower_band = sma - std * num_std
+    bb_percent = (prices - lower_band) / (upper_band - lower_band) * 100
+    return sma, upper_band, lower_band, bb_percent
+
+def calculate_stochastic(high, low, close, window=14):
+    lowest_low = low.rolling(window=window).min()
+    highest_high = high.rolling(window=window).max()
+    stoch_k = (close - lowest_low) / (highest_high - lowest_low) * 100
+    return stoch_k
+
+def calculate_ma_slope(prices, window=20):
+    sma = prices.rolling(window=window).mean()
+    slope = sma.diff()
+    return slope.iloc[-1]
+
+def detect_market_state(prices):
+    slope = calculate_ma_slope(prices)
+    # Threshold value; adjust based on asset volatility.
+    if slope > 0.01:
+        return "trend"
+    else:
+        return "range"
+
+# ---------------- Logging Functions ----------------
+def log_trade(profit, result, reason):
+    global trade_log, current_balance, consecutive_losses
+    time_of_trade = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    trade_log.append({
+        "time": time_of_trade,
+        "profit": profit,
+        "balance": current_balance,
+        "result": result,
+        "reason": reason,
+        "win_streak": consecutive_losses if result == "Win" else 0,
+        "loss_streak": consecutive_losses if result == "Loss" else 0
+    })
+    print(f"Trade Log: {trade_log[-1]}")
+
+def log_skip(reason):
+    time_of_log = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"Skipped trade at {time_of_log} due to: {reason}")
+
+# ---------------- Trade Contract Execution ----------------
+def send_trade_contract(trade_type, stake, duration=5):
+    """
+    Send a trade contract command to Deriv's WebSocket API.
+    In a real implementation, additional parameters and authentication would be required.
+    """
+    if websocket_connection:
+        trade_request = {
+            "trade": 1,
+            "contract_type": trade_type,
+            "stake": stake,
+            "duration": duration,
+            "duration_unit": "m"  # minutes
+        }
+        try:
+            websocket_connection.send(json.dumps(trade_request))
+            print(f"Sent trade contract: {trade_request}")
+        except Exception as e:
+            print(f"Error sending trade contract: {e}")
+    else:
+        print("WebSocket connection unavailable for trade execution.")
+
+# ---------------- Machine Learning Model Training ----------------
+def train_ml_model(df):
+    """
+    Trains a Gradient Boosting model using enhanced features:
+    RSI, MACD histogram, candle body/wick ratio, Bollinger Band % and Stochastic oscillator.
+    """
+    df["price_diff"] = df["close"].diff()
+    df["high_low_diff"] = df["high"] - df["low"]
+    df["body"] = df["close"] - df["open"]
+    df["body_wick_ratio"] = df.apply(lambda row: row["body"] / (row["high"] - row["low"]) if (row["high"] - row["low"]) > 0 else 0, axis=1)
+    df["RSI"] = calculate_rsi(df["close"])
+    _, _, macd_hist = calculate_macd(df["close"])
+    df["MACD_hist"] = macd_hist
+    _, upper_band, _, bb_percent = calculate_bollinger(df["close"])
+    df["bb_percent"] = bb_percent
+    df["stochastic"] = calculate_stochastic(df["high"], df["low"], df["close"])
+    
+    df["target"] = (df["close"].shift(-1) > df["close"]).astype(int)
+    df.dropna(inplace=True)
+    
+    feature_cols = ["price_diff", "high_low_diff", "RSI", "MACD_hist", "body_wick_ratio", "bb_percent", "stochastic"]
+    X = df[feature_cols]
+    y = df["target"]
+    
+    scaler = MinMaxScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    model = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    print(f"ML Model (Gradient Boosting) Accuracy: {accuracy_score(y_test, y_pred)}")
+    return model, scaler
+
+def model_training_scheduler():
+    global ml_model, scaler_global, last_model_train_time
+    while True:
+        time.sleep(MODEL_TRAIN_INTERVAL.total_seconds())
+        # Retrain model if there is sufficient data on at least one market (preferably selected_market)
+        with lock:
+            # For simplicity, use the first available market with candles data.
+            for market in SUPPORTED_MARKETS:
+                if market in candles and len(candles[market]) >= HISTORICAL_CANDLES:
+                    df = pd.DataFrame(candles[market])
+                    ml_model, scaler_global = train_ml_model(df.copy())
+                    last_model_train_time = datetime.now()
+                    print(f"Model retrained at {last_model_train_time} for market {market}")
+                    break
+
+# ---------------- Backtesting Simulation ----------------
+def backtest_simulation(df):
+    print("Starting backtest simulation...")
+    if len(df) < 1000:
+        print("Not enough data for backtesting (need 1000+ candles).")
+        return
+    simulated_balance = initial_balance
+    simulated_stake = initial_balance * 0.01
+    for i in range(1000, len(df)):
+        outcome = np.random.choice(["Win", "Loss"], p=[0.6, 0.4])
+        profit = simulated_stake * stake_growth if outcome == "Win" else -simulated_stake
+        simulated_balance += profit
+        if outcome == "Win":
+            simulated_stake *= 1.05
+        else:
+            simulated_stake *= 0.95
+    print(f"Backtesting simulation completed. Final simulated balance: {simulated_balance}")
+
+# ---------------- Market Analysis & Trade Execution ----------------
+def perform_analysis_and_trade_for_market(market):
+    global candles, current_balance, stake, ml_model, scaler_global, last_model_train_time, consecutive_losses, last_loss_time, is_profit_locked, trade_timestamps, current_profit
+    with lock:
+        if market not in candles or len(candles[market]) < HISTORICAL_CANDLES:
+            if DEBUG_MODE:
+                print(f"Insufficient candle data for market: {market}.")
+            return
+
+        df = pd.DataFrame(candles[market])
+    
+    # Check conditions for trade
+    # Advanced Hybrid Filters: Only trade strong bullish candles (body between 1.5x and 2x previous candle body)
+    if len(df) >= 2:
+        prev_candle = df.iloc[-2]
+        current_candle = df.iloc[-1]
+        prev_body = prev_candle["close"] - prev_candle["open"]
+        current_body = current_candle["close"] - current_candle["open"]
+        if prev_body <= 0 or not (1.5 * prev_body <= current_body <= 2 * prev_body):
+            log_skip(f"[{market}] Candle strength criteria not met. Prev body: {prev_body}, Current body: {current_body}")
+            return
+    else:
+        log_skip(f"[{market}] Not enough candle data for hybrid filter check.")
+        return
+
+    # Calculate indicators
+    df["RSI"] = calculate_rsi(df["close"])
+    macd_line, signal_line, macd_hist = calculate_macd(df["close"])
+    sma, upper_band, lower_band, bb_percent = calculate_bollinger(df["close"])
+    market_state = detect_market_state(df["close"])
+    
+    # Confirm with indicators: MACD crossover, RSI between 50–70, Bollinger breakout
+    if macd_hist.iloc[-1] <= 0:
+        log_skip(f"[{market}] MACD crossover not confirmed (MACD histogram not positive).")
+        return
+    if df["RSI"].iloc[-1] < 50 or df["RSI"].iloc[-1] > 70:
+        log_skip(f"[{market}] RSI out of range (current RSI: {df['RSI'].iloc[-1]:.2f}).")
+        return
+    if df["close"].iloc[-1] < upper_band.iloc[-1]:
+        log_skip(f"[{market}] Bollinger breakout not detected (price below upper band).")
+        return
+
+    if market_state != "trend":
+        log_skip(f"[{market}] Market state is '{market_state}', not trending.")
+        return
+
+    # Confidence Score Calculation (0–100)
+    confidence_score = 0
+    if current_body >= 1.5 * prev_body and current_body <= 2 * prev_body:
+        confidence_score += 25
+    if macd_hist.iloc[-1] > 0:
+        confidence_score += 20
+    if 50 <= df["RSI"].iloc[-1] <= 70:
+        confidence_score += 20
+    if df["close"].iloc[-1] >= upper_band.iloc[-1]:
+        confidence_score += 15
+    if market_state == "trend":
+        confidence_score += 20
+    print(f"[{market}] Calculated confidence score: {confidence_score}")
+    if confidence_score < 85:
+        log_skip(f"[{market}] Confidence score below threshold (score: {confidence_score} < 85).")
+        return
+
+    # Trade Frequency Control
+    current_time = datetime.now()
+    trade_timestamps[:] = [ts for ts in trade_timestamps if current_time - ts < timedelta(minutes=1)]
+    if len(trade_timestamps) >= TRADE_LIMIT_PER_MINUTE:
+        print(f"[{market}] Trade frequency limit reached. Skipping trade.")
+        return
+
+    # ML Model Signal: Prepare enhanced features for ML model
+    df["price_diff"] = df["close"].diff()
+    df["high_low_diff"] = df["high"] - df["low"]
+    df["body"] = df["close"] - df["open"]
+    df["body_wick_ratio"] = df.apply(lambda row: row["body"] / (row["high"] - row["low"]) if (row["high"] - row["low"]) > 0 else 0, axis=1)
+    df["RSI"] = calculate_rsi(df["close"])
+    _, _, macd_hist = calculate_macd(df["close"])
+    df["MACD_hist"] = macd_hist
+    _, upper_band, _, bb_percent = calculate_bollinger(df["close"])
+    df["bb_percent"] = bb_percent
+    df["stochastic"] = calculate_stochastic(df["high"], df["low"], df["close"])
+    feature_cols = ["price_diff", "high_low_diff", "RSI", "MACD_hist", "body_wick_ratio", "bb_percent", "stochastic"]
+    df.dropna(inplace=True)
+
+    if ml_model is None or scaler_global is None or (last_model_train_time is None or datetime.now() - last_model_train_time >= MODEL_TRAIN_INTERVAL):
+        print(f"[{market}] Training ML model with enhanced features...")
+        ml_model, scaler_global = train_ml_model(df.copy())
+        last_model_train_time = datetime.now()
+        print(f"[{market}] ML model training complete.")
+    
+    latest_features = df[feature_cols].iloc[-1:]
+    latest_scaled = scaler_global.transform(latest_features)
+    ml_prediction = ml_model.predict(latest_scaled)
+    print(f"[{market}] ML model prediction: {'BUY signal' if ml_prediction[0] == 1 else 'NO trade signal'}")
+    if ml_prediction[0] != 1:
+        log_skip(f"[{market}] ML model did not trigger a BUY signal.")
+        return
+    else:
+        confidence_score += 10
+
+    if confidence_score < 85:
+        log_skip(f"[{market}] Final confidence score below threshold after ML signal (score: {confidence_score}).")
+        return
+
+    # Execute Trade
+    if last_trade_time is None or datetime.now() - last_trade_time > COOLDOWN_PERIOD:
+        if current_profit >= daily_profit_target:
+            print(f"[{market}] Daily profit target reached. Halting trades.")
+            return
+        if current_balance <= initial_balance - daily_loss_limit:
+            print(f"[{market}] Daily loss limit reached. Halting trades.")
+            return
+        print(f"[{market}] Trade signal detected. Executing trade...")
+        execute_trade(f"Aligned filters & ML signal triggered trade on {market}")
+        trade_timestamps.append(datetime.now())
+    else:
+        print(f"[{market}] Cooldown active. Waiting before executing the next trade.")
+
+# ---------------- Market Scanner (24/7 Scanning) ----------------
+def market_scanner():
+    while True:
+        for market in SUPPORTED_MARKETS:
+            # Launch analysis for each market in a separate thread to avoid delays.
+            threading.Thread(target=perform_analysis_and_trade_for_market, args=(market,)).start()
+        time.sleep(5)  # scan markets every 5 seconds
+
+# ---------------- Trade Execution with Dynamic Stake Control ----------------
+def execute_trade(reason):
+    global stake, current_balance, consecutive_losses, last_loss_time, is_profit_locked, current_profit, last_trade_time
+    # Send trade contract to Deriv's WebSocket API
+    send_trade_contract("CALL", stake, duration=5)
+    # Simulate trade outcome in parallel with API call for demonstration purposes.
+    trade_outcome = np.random.choice(["Win", "Loss"], p=[0.6, 0.4])
+    profit = stake * stake_growth if trade_outcome == "Win" else -stake
+    current_balance += profit
+    current_profit += profit
+    if trade_outcome == "Win":
+        consecutive_losses = 0
+        stake = min(stake * 1.05, max_stake)
+    else:
+        consecutive_losses += 1
+        last_loss_time = datetime.now()
+        stake = max(initial_balance * 0.01, stake * 0.95)
+    if current_profit >= PROFIT_LOCK_THRESHOLD:
+        is_profit_locked = True
+        print("Profit lock triggered. Pausing trades.")
+    log_trade(profit, trade_outcome, reason)
+    print(f"Trade result: {trade_outcome}. Profit: {profit}. Current balance: {current_balance}.")
+    last_trade_time = datetime.now()
+
+# ---------------- WebSocket & Real-Time Candle Feed ----------------
+def reconnect_with_backoff():
+    global websocket_connection
+    backoff = 1
+    max_backoff = 30
+    while True:
+        try:
+            print(f"Reconnecting in {backoff} seconds...")
+            time.sleep(backoff)
+            websocket_connection = websocket.WebSocketApp(
+                DERIV_WS_URL,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close,
+                on_open=on_open,
+            )
+            websocket_connection.run_forever()
+            break
+        except Exception as e:
+            print(f"Reconnection failed: {e}")
+            backoff = min(backoff * 2, max_backoff)
+
+def handle_ticks(tick):
+    global candles
+    symbol = tick["symbol"]
+    with lock:
+        if symbol not in candles:
+            candles[symbol] = []
+        # Update real-time candle feed; aggregate ticks into 1-minute candles
+        current_time = datetime.utcfromtimestamp(tick["epoch"])
+        current_minute = current_time.replace(second=0, microsecond=0)
+        if len(candles[symbol]) == 0 or candles[symbol][-1]["time"] != current_minute:
+            candles[symbol].append({
+                "time": current_minute,
+                "open": tick["quote"],
+                "high": tick["quote"],
+                "low": tick["quote"],
+                "close": tick["quote"]
+            })
+        else:
+            candle = candles[symbol][-1]
+            candle["high"] = max(candle["high"], tick["quote"])
+            candle["low"] = min(candle["low"], tick["quote"])
+            candle["close"] = tick["quote"]
+        if len(candles[symbol]) > HISTORICAL_CANDLES:
+            candles[symbol].pop(0)
+
+# ---------------- WebSocket Event Handlers ----------------
+def on_message(ws, message):
+    global selected_market, scanner_thread_started
+    data = json.loads(message)
+    if "authorize" in data:
+        print("Authorization successful.")
+        fetch_markets(ws)
+    if "tick" in data:
+        handle_ticks(data["tick"])
+    if "active_symbols" in data:
+        symbols = data["active_symbols"]
+        # Optionally, set selected_market based on a preferred criteria, if needed.
+        selected_market = next((symbol["symbol"] for symbol in symbols if symbol["symbol"] in SUPPORTED_MARKETS), None)
+        if selected_market:
+            print(f"Initial selected market: {selected_market}")
+            subscribe_to_market_data(ws, selected_market)
+    # Start market scanner thread if not already running
+    if not scanner_thread_started:
+        scanner_thread = threading.Thread(target=market_scanner, daemon=True)
+        scanner_thread.start()
+        scanner_thread_started = True
+
+def on_error(ws, error):
+    print(f"WebSocket Error: {error}")
+    reconnect_with_backoff()
+
+def on_close(ws, close_status_code, close_msg):
+    print("WebSocket Closed")
+    reconnect_with_backoff()
+
+def on_open(ws):
+    print("WebSocket Connection Opened")
+    authorize(ws)
+
+def authorize(ws):
+    auth_request = {"authorize": API_TOKEN}
+    ws.send(json.dumps(auth_request))
+
+def fetch_markets(ws):
+    market_request = {"active_symbols": "brief", "product_type": "basic"}
+    ws.send(json.dumps(market_request))
+    print("Fetching Available Markets...")
+
+def subscribe_to_market_data(ws, market):
+    market_request = {"ticks": market, "subscribe": 1}
+    ws.send(json.dumps(market_request))
+    print(f"Subscribed to Market Data for {market}")
+
+# ---------------- Main ----------------
+if __name__ == "__main__":
+    # If the script is called with 'backtest' argument, run backtesting simulation on dummy historical data.
+    if len(sys.argv) > 1 and sys.argv[1] == "backtest":
+        dates = pd.date_range(datetime.now() - timedelta(minutes=1100), periods=1100, freq="T")
+        dummy_data = pd.DataFrame({
+            "time": dates,
+            "open": np.random.rand(1100) * 100,
+            "high": np.random.rand(1100) * 100 + 100,
+            "low": np.random.rand(1100) * 100,
+            "close": np.random.rand(1100) * 100 + 50,
+        })
+        backtest_simulation(dummy_data)
+    else:
+        # Start model training scheduler in the background
+        threading.Thread(target=model_training_scheduler, daemon=True).start()
+        websocket_connection = websocket.WebSocketApp(
+            DERIV_WS_URL,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open,
+        )
+        websocket_connection.run_forever()
